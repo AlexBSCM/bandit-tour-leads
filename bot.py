@@ -14,7 +14,6 @@ import socket
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 from google import generativeai as genai
@@ -81,8 +80,8 @@ def save_leads(leads):
 def build_patterns(keywords):
     patterns = []
     for kw in keywords:
-        if re.fullmatch(r"[a-zA-Z\\s]+", kw) and len(kw) <= 15:
-            pat = r"\\b" + re.escape(kw) + r"\\b"
+        if re.fullmatch(r"[a-zA-Z\s]+", kw) and len(kw) <= 15:
+            pat = r"\b" + re.escape(kw) + r"\b"
         else:
             pat = re.escape(kw)
         patterns.append(re.compile(pat, re.IGNORECASE))
@@ -145,17 +144,20 @@ def init_gemini(api_key, model_name):
     genai.configure(api_key=api_key)
     return genai.GenerativeModel(model_name)
 
-def classify_message(model, text, max_retries=3):
+async def classify_message(model, text, max_retries=3):
     if not text or len(text.strip()) < 10:
         return {"is_lead": False, "category": "noise", "reason": "слишком короткое"}
     prompt = CLASSIFY_PROMPT.format(message=text[:1500])
     for attempt in range(max_retries):
+        raw = ""
         try:
-            resp = model.generate_content(prompt)
-            raw = resp.text.strip()
+            # generate_content — синхронный сетевой вызов: выполняем в отдельном потоке,
+            # чтобы event loop Telethon не замораживался
+            resp = await asyncio.to_thread(model.generate_content, prompt)
+            raw = (resp.text or "").strip()
             if raw.startswith("```"):
-                raw = re.sub(r"^```(?:json)?\\s*", "", raw)
-                raw = re.sub(r"\\s*```$", "", raw)
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
             data = json.loads(raw)
             return {
                 "is_lead": bool(data.get("is_lead", False)),
@@ -163,12 +165,15 @@ def classify_message(model, text, max_retries=3):
                 "reason": data.get("reason", "")[:200],
             }
         except json.JSONDecodeError as e:
-            return {"is_lead": False, "category": "noise", "reason": f"неверный JSON: {e}"}
+            log.warning(f"Gemini вернул не-JSON (попытка {attempt+1}/{max_retries}): {raw[:200]}")
+            if attempt == max_retries - 1:
+                return {"is_lead": False, "category": "noise", "reason": f"неверный JSON: {e}"}
+            await asyncio.sleep(2)
         except Exception as e:
             msg = str(e)
             if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
                 wait = 30
-                m = re.search(r"retry in ([\\d.]+)s", msg.lower()) or re.search(r"seconds:\\s*(\\d+)", msg.lower())
+                m = re.search(r"retry in ([\d.]+)s", msg.lower()) or re.search(r"seconds:\s*(\d+)", msg.lower())
                 if m:
                     try:
                         wait = int(float(m.group(1))) + 2
@@ -176,11 +181,20 @@ def classify_message(model, text, max_retries=3):
                         pass
                 if attempt < max_retries - 1:
                     log.warning(f"  rate_limited, жду {wait}с (попытка {attempt+1}/{max_retries})")
-                    time.sleep(wait)
+                    await asyncio.sleep(wait)
                     continue
                 return {"is_lead": False, "category": "rate_limited", "reason": "лимит Gemini"}
             return {"is_lead": False, "category": "error", "reason": f"{type(e).__name__}: {msg[:100]}"}
     return {"is_lead": False, "category": "error", "reason": "все попытки исчерпаны"}
+
+
+def _lead_key(lead_or_channel, msg_id=None):
+    # Ключ дедупликации: (канал, id). ID сообщений уникальны только внутри канала.
+    # Миграция: старые записи в matches_found.json уже содержат channel+id,
+    # поэтому пересобираются автоматически; у записей без channel — fallback "?".
+    if isinstance(lead_or_channel, dict):
+        return (lead_or_channel.get("channel") or "?", lead_or_channel.get("id"))
+    return (lead_or_channel or "?", msg_id)
 
 
 class BotState:
@@ -189,7 +203,7 @@ class BotState:
         self.patterns = build_patterns(self.config["keywords"])
         self.gemini = init_gemini(self.config["gemini_api_key"], self.config.get("gemini_model", "gemini-2.5-flash-lite"))
         self.leads = load_leads()
-        self.known_ids = {x["id"] for x in self.leads}
+        self.known_ids = {_lead_key(x) for x in self.leads}
         self.is_listening = True
         self.stats_today = {"hot": 0, "warm": 0, "spam": 0, "noise": 0, "rate_limited": 0, "error": 0}
         self.stats_total = dict(self.stats_today)
@@ -203,13 +217,14 @@ class BotState:
         self.config = load_config()
         self.patterns = build_patterns(self.config["keywords"])
 
-    def is_lead_known(self, msg_id):
-        return msg_id in self.known_ids
+    def is_lead_known(self, channel, msg_id):
+        return _lead_key(channel, msg_id) in self.known_ids
 
     def add_lead(self, lead):
-        if lead["id"] not in self.known_ids:
+        key = _lead_key(lead)
+        if key not in self.known_ids:
             self.leads.append(lead)
-            self.known_ids.add(lead["id"])
+            self.known_ids.add(key)
             save_leads(self.leads)
 
     def add_stat(self, category):
@@ -239,15 +254,20 @@ NOTIFY_TEMPLATE = """🎯 НОВЫЙ ЛИД — BanditTour
 🔗 Ссылка: {link}"""
 
 
+_MOJIBAKE_RE = re.compile(r"(?:[РС][^\x00-\x7F]){3,}")
+
 def fix_mojibake(text):
     if not text:
         return text
-    if "Р" in text or "С" in text:
-        try:
-            return text.encode("windows-1251", errors="ignore").decode("utf-8", errors="replace")
-        except:
-            pass
-    return text
+    # Безопасная эвристика: чиним только цепочки вида "РџСЂРёРІРµС‚" (3+ подряд
+    # пар "Р/С + не-ASCII"). Одиночные Р/С в нормальном тексте не трогаем.
+    if not _MOJIBAKE_RE.search(text):
+        return text
+    try:
+        fixed = text.encode("windows-1251").decode("utf-8")
+        return fixed
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
 
 def format_thai_time(date_str):
     if not date_str or len(date_str) < 16:
@@ -301,12 +321,12 @@ async def process_new_message(event):
         channel = "?"
         channel_title = "?"
 
-    if bs.is_lead_known(msg.id):
+    if bs.is_lead_known(channel, msg.id):
         return
 
     log.info(f"Новое сообщение в {channel_title} (id={msg.id}): {text[:80]}...")
 
-    result = classify_message(bs.gemini, text)
+    result = await classify_message(bs.gemini, text)
     cat = result["category"]
     bs.add_stat(cat)
     log.info(f"  → {cat}: {result['reason']}")
@@ -445,10 +465,10 @@ async def cmd_lead_full(event, index):
     lead = bs.leads[index]
     full_text = lead.get("text", "")
     emoji = {"hot": "🔥", "warm": "🌤", "spam": "🗑", "noise": "❌"}.get(lead.get("category", ""), "❓")
-    date = lead.get("date", "?")[:16].replace("T", " ")
+    date_part, time_part = format_thai_time(lead.get("date"))
     channel_title = lead.get("channel_title", lead.get("channel", "?"))
     header = f"{emoji} **ПОЛНОЕ СООБЩЕНИЕ** | {date_part} 🕐 {time_part}\n📍 {channel_title}\n\n```\n"
-    footer = "\\n```"
+    footer = "\n```"
     max_chunk = 4000 - len(header) - len(footer)
     chunks = [full_text[i:i+max_chunk] for i in range(0, len(full_text), max_chunk)]
     for i, chunk in enumerate(chunks):
@@ -842,7 +862,7 @@ async def cmd_help(event):
 
 **Файлы:**
 • `matches_found.json` — все лиды
-• `logs/bot.log` — логи"""
+• `logs/bot_*.log` — логи"""
     await event.edit(text, parse_mode="md", buttons=[Button.inline("◀️ Назад", b"menu")])
 
 async def cmd_scan(event):
@@ -956,8 +976,8 @@ async def cmd_scan_execute(event, mode):
                     new_leads_for_channel = 0
                     for m in candidates:
                         if bs.stop_scan: break
-                        if bs.is_lead_known(m["id"]): continue
-                        result = classify_message(bs.gemini, m["text"])
+                        if bs.is_lead_known(m.get("channel"), m["id"]): continue
+                        result = await classify_message(bs.gemini, m["text"])
                         cat = result["category"]
                         bs.add_stat(cat)
                         total_gemini += 1
@@ -970,7 +990,7 @@ async def cmd_scan_execute(event, mode):
                             await send_notification(m)
                             new_leads_for_channel += 1
                             total_new += 1
-                        time.sleep(5.5)
+                        await asyncio.sleep(5.5)
                     log.info(f"  New leads: {new_leads_for_channel}")
                 bs.state[channel] = {
                     "last_id": max_id_seen,

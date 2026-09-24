@@ -75,7 +75,6 @@ chart.png
 
 # === Dashboard и временные файлы ===
 dashboard.html
-dashboard_server.py
 generate_dashboard.py
 write_dashboard.py
 fix_*.py

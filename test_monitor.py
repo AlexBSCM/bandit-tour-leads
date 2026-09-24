@@ -338,16 +338,17 @@ async def run():
             print(f"\n  → Канал {channel}: найдено лидов {len(leads)}, last_id → {max_id_seen}")
 
             # Загружаем существующие ID лидов (для дедупликации уведомлений)
+            # Ключ: (канал, id), т.к. id уникальны только внутри канала
             existing_ids = set()
             if OUTPUT_PATH.exists():
                 try:
                     existing_data = json.loads(OUTPUT_PATH.read_text(encoding="utf-8"))
-                    existing_ids = {x.get("id") for x in existing_data}
+                    existing_ids = {(x.get("channel") or "?", x.get("id")) for x in existing_data}
                 except Exception:
                     pass
 
             # Отправляем уведомления ТОЛЬКО по новым лидам
-            new_leads_for_notify = [l for l in leads if l["id"] not in existing_ids]
+            new_leads_for_notify = [l for l in leads if ((l.get("channel") or "?", l["id"])) not in existing_ids]
             if leads:
                 print(f"  📨 Отправка уведомлений: {len(new_leads_for_notify)} новых / {len(leads)} всего найдено")
                 if len(new_leads_for_notify) < len(leads):
@@ -375,8 +376,8 @@ async def run():
         except Exception:
             existing = []
 
-    existing_ids = {x["id"] for x in existing}
-    new_leads = [l for l in all_new_leads if l["id"] not in existing_ids]
+    existing_ids = {(x.get("channel") or "?", x.get("id")) for x in existing}
+    new_leads = [l for l in all_new_leads if ((l.get("channel") or "?", l.get("id"))) not in existing_ids]
     all_leads = existing + new_leads
     all_leads.sort(key=lambda x: x.get("date", ""), reverse=True)
     OUTPUT_PATH.write_text(

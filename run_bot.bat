@@ -1,26 +1,31 @@
 @echo off
 chcp 65001 > nul
-cd /d D:\BanditTour\Lids_from_TG
+rem Запуск из папки, где лежит сам скрипт (работает на любом диске/ПК)
+cd /d "%~dp0"
 
-set PYTHON_EXE=C:\Users\AVZ\AppData\Local\Python\pythoncore-3.12-64\python.exe
+if not exist logs mkdir logs
+echo [%date% %time%] Starting bot >> logs\startup.log
 
-echo [%date% %time%] Starting bot hidden >> logs\startup.log
+where python >nul 2>nul
+if %errorlevel% neq 0 (
+    echo [%date% %time%] ERROR: python not found in PATH >> logs\startup.log
+    echo Python не найден в PATH. Установите Python 3.10+ и отметьте "Add to PATH".
+    exit /b 1
+)
 
-REM ��������� ����� VBScript � ���� �� ��������
-cscript //nologo "D:\BanditTour\Lids_from_TG\run_bot_hidden.vbs"
+rem Запуск бота скрыто через pythonw (без окна консоли)
+start "" /min pythonw.exe bot.py
 
-REM ��� 5 ������
 timeout /t 5 /nobreak > nul
 
-REM ��������� �������
-tasklist /FI "IMAGENAME eq python.exe" 2>nul | find /I "python.exe" > nul
+tasklist /FI "IMAGENAME eq pythonw.exe" 2>nul | find /I "pythonw.exe" > nul
 if %errorlevel% equ 0 (
-    echo [%date% %time%] Bot started OK >> logs\startup.log
+    echo [%date% %time%] Bot started OK (pythonw) >> logs\startup.log
 ) else (
-    tasklist /FI "IMAGENAME eq pythonw.exe" 2>nul | find /I "pythonw.exe" > nul
+    tasklist /FI "IMAGENAME eq python.exe" 2>nul | find /I "python.exe" > nul
     if %errorlevel% equ 0 (
-        echo [%date% %time%] Bot started OK pythonw >> logs\startup.log
+        echo [%date% %time%] Bot started OK (python) >> logs\startup.log
     ) else (
-        echo [%date% %time%] WARNING python not found >> logs\startup.log
+        echo [%date% %time%] WARNING: python process not found after start >> logs\startup.log
     )
 )
