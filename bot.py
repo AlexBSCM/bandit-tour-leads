@@ -166,6 +166,27 @@ def init_gemini(api_key, model_name):
     genai.configure(api_key=api_key)
     return genai.GenerativeModel(model_name)
 
+
+def _probe_gemini_key(api_key, model_name):
+    """Один дешёвый запрос для проверки ключа. Возвращает (жив, причина).
+
+    403 → ключ мёртвый. 429 → ключ валидный, просто сейчас лимит.
+    Прочие ошибки (сеть и т.п.) — ключ НЕ помечаем мёртвым, считаем живым.
+    """
+    try:
+        model = init_gemini(api_key, model_name)
+        resp = model.generate_content("скажи ок")
+        _ = (resp.text or "").strip()
+        return True, "OK"
+    except Exception as e:
+        msg = str(e)
+        if any(s in msg for s in ("403", "PERMISSION_DENIED", "API key not valid",
+                                  "denied access", "API_KEY_INVALID")):
+            return False, "403 доступ запрещён"
+        if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+            return True, "жив, но сейчас лимит (429)"
+        return True, "не проверен (%s: %s)" % (type(e).__name__, msg[:60])
+
 async def classify_message(model, text, max_retries=3):
     if not text or len(text.strip()) < 10:
         return {"is_lead": False, "category": "noise", "reason": "слишком короткое"}
@@ -262,6 +283,26 @@ class BotState:
         self.gemini_keys_dead = set()  # ключи, отвалившиеся с 403/доступом запрещён
         self.gemini_model_name = self.config.get("gemini_model", "gemini-2.5-flash-lite")
         self.gemini = init_gemini(self.gemini_keys[0], self.gemini_model_name)
+        # стартовая проверка: мёртвые ключи помечаем сразу, стартуем с первого живого
+        log.info(f"Проверка ключей Gemini ({len(self.gemini_keys)} шт.)...")
+        for i, key in enumerate(self.gemini_keys):
+            alive, reason = _probe_gemini_key(key, self.gemini_model_name)
+            if alive:
+                log.info(f"  ключ #{i + 1}: {reason}")
+            else:
+                self.gemini_keys_dead.add(i)
+                log.warning(f"  ключ #{i + 1}: МЁРТВЫЙ ({reason}) — будет пропускаться")
+        alive_n = len(self.gemini_keys) - len(self.gemini_keys_dead)
+        if alive_n > 0:
+            for i in range(len(self.gemini_keys)):
+                if i not in self.gemini_keys_dead:
+                    self.gemini_key_idx = i
+                    self.gemini = init_gemini(self.gemini_keys[i], self.gemini_model_name)
+                    break
+            log.info(f"Итог: ключей {len(self.gemini_keys)}, живых {alive_n} — "
+                     f"стартую с ключа #{self.gemini_key_idx + 1}")
+        else:
+            log.error("НЕТ ЖИВЫХ ключей Gemini — классификация будет падать в error")
         self.leads = load_leads()
         self.known_ids = {_lead_key(x) for x in self.leads}
         self.is_listening = True
