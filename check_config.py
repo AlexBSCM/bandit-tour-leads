@@ -47,4 +47,15 @@ for i, key in enumerate(keys, 1):
     except Exception as e:
         print("GEMINI #%d: FAIL %s -> %s" % (i, type(e).__name__, e))
 
+# channels: prefer channels.json (tracked in git) over config
+ch_file = Path("channels.json")
+if ch_file.exists():
+    try:
+        _cj = json.loads(ch_file.read_text(encoding="utf-8-sig"))
+        _ch = _cj.get("channels", _cj) if isinstance(_cj, dict) else _cj
+        print("channels.json:", len(_ch), _ch)
+    except Exception as e:
+        print("channels.json: FAIL", e)
+else:
+    print("channels.json: отсутствует (каналы берутся из test_config.json)")
 print("channels:", cfg.get("channels"))

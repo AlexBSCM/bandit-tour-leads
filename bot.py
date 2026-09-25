@@ -29,6 +29,7 @@ plt.rcParams["axes.unicode_minus"] = False
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "test_config.json"
+CHANNELS_PATH = BASE_DIR / "channels.json"
 OUTPUT_PATH = BASE_DIR / "matches_found.json"
 STATE_PATH = BASE_DIR / "scan_state.json"
 SESSION_USER = str(BASE_DIR / "session_user")
@@ -49,10 +50,31 @@ log = logging.getLogger("bot")
 
 
 def load_config():
-    return json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+    cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+    # Каналы живут в channels.json (этот файл публикуется в git, секретов там нет).
+    # Если файла нет — остаёмся на списке из test_config.json.
+    try:
+        if CHANNELS_PATH.exists():
+            data = json.loads(CHANNELS_PATH.read_text(encoding="utf-8-sig"))
+            if isinstance(data, dict):
+                data = data.get("channels", [])
+            if isinstance(data, list) and data:
+                cfg["channels"] = [str(c) for c in data]
+    except Exception as e:
+        log.warning("channels.json прочитать не удалось (%s), беру каналы из config", e)
+    return cfg
 
 def save_config(config):
     CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    # список каналов дублируем в channels.json (он в git) — добавление/удаление
+    # канала прямо из бота сразу попадёт в репозиторий
+    try:
+        CHANNELS_PATH.write_text(
+            json.dumps({"channels": config.get("channels", [])},
+                       ensure_ascii=False, indent=1) + "\n",
+            encoding="utf-8")
+    except Exception as e:
+        log.warning("не удалось записать channels.json: %s", e)
 
 def load_state():
     if STATE_PATH.exists():

@@ -115,6 +115,7 @@ API: /api/leads, /api/stats.
 | watchdog.ps1 | Автоперезапуск bot.py (Windows) | Да |
 | requirements.txt | Python-зависимости | Да |
 | config.example.json | Пример конфигурации | Да |
+| channels.json | Список слушаемых каналов (без секретов) | Да |
 | .gitignore | Игнорируемые файлы | Да |
 | README.md | Этот файл | Да |
 | test_config.json | Реальная конфигурация с секретами | Нет (gitignored) |
@@ -122,6 +123,7 @@ API: /api/leads, /api/stats.
 | session_bot.session | Сессия bot-аккаунта (Telethon) | Нет (gitignored) |
 | matches_found.json | Найденные лиды | Нет (gitignored) |
 | scan_state.json | Состояние last_id по каналам | Нет (gitignored) |
+| lead_ui_state.json | Статусы лидов в дашборде (новый/прочитан/архив) | Нет (gitignored) |
 | logs/ | Логи работы бота | Нет (gitignored) |
 
 ## Безопасность
