@@ -82,3 +82,6 @@ add_*.py
 rewrite_*.py
 smart_scan*.py
 update_prompt*.py
+
+# === Статусы лидов в дашборде (рабочие данные) ===
+lead_ui_state.json

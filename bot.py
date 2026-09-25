@@ -148,7 +148,13 @@ async def classify_message(model, text, max_retries=3):
     if not text or len(text.strip()) < 10:
         return {"is_lead": False, "category": "noise", "reason": "слишком короткое"}
     prompt = CLASSIFY_PROMPT.format(message=text[:1500])
-    for attempt in range(max_retries):
+    attempt = 0
+    rotations = 0
+    # сколько раз за одно сообщение можно переключиться на другой ключ
+    max_rotations = 0
+    if bs is not None:
+        max_rotations = max(0, len(getattr(bs, "gemini_keys", [])) - 1)
+    while attempt < max_retries:
         raw = ""
         try:
             # generate_content — синхронный сетевой вызов: выполняем в отдельном потоке,
@@ -168,10 +174,30 @@ async def classify_message(model, text, max_retries=3):
             log.warning(f"Gemini вернул не-JSON (попытка {attempt+1}/{max_retries}): {raw[:200]}")
             if attempt == max_retries - 1:
                 return {"is_lead": False, "category": "noise", "reason": f"неверный JSON: {e}"}
+            attempt += 1
             await asyncio.sleep(2)
         except Exception as e:
             msg = str(e)
+            # ключ отвалился намертво (заблокирован/неверный) — помечаем и уходим на другой
+            dead = ("403" in msg or "PERMISSION_DENIED" in msg
+                    or "API key not valid" in msg or "denied access" in msg
+                    or "API_KEY_INVALID" in msg)
+            if dead and bs is not None:
+                bs.mark_gemini_key_dead(msg)
+                if rotations < max_rotations and bs.rotate_gemini_key():
+                    model = bs.gemini
+                    rotations += 1
+                    await asyncio.sleep(2)
+                    continue  # попытку не засчитываем
+                return {"is_lead": False, "category": "error",
+                        "reason": "нет рабочего ключа Gemini (403)"}
             if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                # сначала пробуем ДРУГОЙ ключ (если он есть) — это дешевле, чем ждать
+                if rotations < max_rotations and bs is not None and bs.rotate_gemini_key():
+                    model = bs.gemini
+                    rotations += 1
+                    await asyncio.sleep(3)
+                    continue  # попытку не засчитываем: лимит был у старого ключа
                 wait = 30
                 m = re.search(r"retry in ([\d.]+)s", msg.lower()) or re.search(r"seconds:\s*(\d+)", msg.lower())
                 if m:
@@ -182,6 +208,7 @@ async def classify_message(model, text, max_retries=3):
                 if attempt < max_retries - 1:
                     log.warning(f"  rate_limited, жду {wait}с (попытка {attempt+1}/{max_retries})")
                     await asyncio.sleep(wait)
+                    attempt += 1
                     continue
                 return {"is_lead": False, "category": "rate_limited", "reason": "лимит Gemini"}
             return {"is_lead": False, "category": "error", "reason": f"{type(e).__name__}: {msg[:100]}"}
@@ -201,7 +228,18 @@ class BotState:
     def __init__(self):
         self.config = load_config()
         self.patterns = build_patterns(self.config["keywords"])
-        self.gemini = init_gemini(self.config["gemini_api_key"], self.config.get("gemini_model", "gemini-2.5-flash-lite"))
+        # поддержка одного или нескольких ключей Gemini:
+        # "gemini_api_keys": ["key1", "key2", ...] либо старый формат "gemini_api_key"
+        keys = self.config.get("gemini_api_keys")
+        if not keys:
+            keys = [self.config.get("gemini_api_key")]
+        self.gemini_keys = [k for k in keys if k]
+        if not self.gemini_keys:
+            raise RuntimeError("Нет ключа Gemini: задайте gemini_api_keys (или gemini_api_key)")
+        self.gemini_key_idx = 0
+        self.gemini_keys_dead = set()  # ключи, отвалившиеся с 403/доступом запрещён
+        self.gemini_model_name = self.config.get("gemini_model", "gemini-2.5-flash-lite")
+        self.gemini = init_gemini(self.gemini_keys[0], self.gemini_model_name)
         self.leads = load_leads()
         self.known_ids = {_lead_key(x) for x in self.leads}
         self.is_listening = True
@@ -216,6 +254,32 @@ class BotState:
     def reload_config(self):
         self.config = load_config()
         self.patterns = build_patterns(self.config["keywords"])
+
+    def rotate_gemini_key(self):
+        """Переключает на следующий РАБОЧИЙ ключ Gemini. True — если переключились."""
+        n = len(self.gemini_keys)
+        for step in range(1, n + 1):
+            i = (self.gemini_key_idx + step) % n
+            if i in self.gemini_keys_dead:
+                continue
+            if i == self.gemini_key_idx:
+                break
+            self.gemini_key_idx = i
+            self.gemini = init_gemini(self.gemini_keys[i], self.gemini_model_name)
+            log.warning(f"  ⇨ Переключился на ключ Gemini #{i + 1} из {n}")
+            return True
+        return False
+
+    def mark_gemini_key_dead(self, reason=""):
+        """Помечает текущий ключ нерабочим (403/доступ запрещён)."""
+        i = self.gemini_key_idx
+        if i in self.gemini_keys_dead:
+            return
+        self.gemini_keys_dead.add(i)
+        alive = len(self.gemini_keys) - len(self.gemini_keys_dead)
+        log.warning(f"  ✖ Ключ Gemini #{i + 1} нерабочий ({reason[:80]}); живых: {alive}")
+        if alive == 0:
+            log.error("  ✖ НЕТ ЖИВЫХ ключей Gemini — классификация невозможна")
 
     def is_lead_known(self, channel, msg_id):
         return _lead_key(channel, msg_id) in self.known_ids
@@ -330,6 +394,17 @@ async def process_new_message(event):
     cat = result["category"]
     bs.add_stat(cat)
     log.info(f"  → {cat}: {result['reason']}")
+
+    # помечаем сообщение сделанным, чтобы следующий скан не классифицировал его повторно
+    # (при лимите/ошибке не помечаем — тогда скан повторит попытку)
+    if cat not in ("rate_limited", "error"):
+        chan_state = bs.state.get(channel, {})
+        done = set(chan_state.get("done_ids", []))
+        done.add(msg.id)
+        chan_state = dict(chan_state)
+        chan_state["done_ids"] = sorted(done)
+        bs.state[channel] = chan_state
+        save_state(bs.state)
 
     if result["is_lead"]:
         lead = {
@@ -941,6 +1016,7 @@ async def cmd_scan_execute(event, mode):
         total_scanned = 0
         total_gemini = 0
         channels_processed = 0
+        rate_limit_hit = False
         chs = config["channels"]
         for channel in chs:
             if bs.stop_scan: break
@@ -949,6 +1025,8 @@ async def cmd_scan_execute(event, mode):
                 title = getattr(entity, "title", channel)
                 chan_state = bs.state.get(channel, {})
                 last_id = chan_state.get("last_id", 0)
+                # уже классифицированные сообщения этого канала — для возобновления после обрыва
+                done_ids = set(chan_state.get("done_ids", []))
                 is_first_scan = (last_id == 0)
                 initial_days = config.get("initial_scan_days", 60)
                 min_date = None
@@ -976,6 +1054,7 @@ async def cmd_scan_execute(event, mode):
                     new_leads_for_channel = 0
                     for m in candidates:
                         if bs.stop_scan: break
+                        if m["id"] in done_ids: continue
                         if bs.is_lead_known(m.get("channel"), m["id"]): continue
                         result = await classify_message(bs.gemini, m["text"])
                         cat = result["category"]
@@ -990,14 +1069,40 @@ async def cmd_scan_execute(event, mode):
                             await send_notification(m)
                             new_leads_for_channel += 1
                             total_new += 1
+                        if cat in ("rate_limited", "error"):
+                            # лимит/ошибка: НЕ помечаем сделанным — повторим при следующем скане
+                            if cat == "rate_limited":
+                                rate_limit_hit = True
+                                bs.stop_scan = True
+                        else:
+                            done_ids.add(m["id"])
+                        # прогресс канала сохраняем сразу, чтобы не повторять Gemini-классификацию после обрыва
+                        bs.state[channel] = {
+                            "last_id": last_id,
+                            "done_ids": sorted(done_ids),
+                            "last_scan_at": datetime.now(timezone.utc).isoformat(),
+                            "first_scan_at": chan_state.get("first_scan_at", datetime.now(timezone.utc).isoformat()),
+                        }
+                        save_state(bs.state)
                         await asyncio.sleep(5.5)
                     log.info(f"  New leads: {new_leads_for_channel}")
-                bs.state[channel] = {
-                    "last_id": max_id_seen,
-                    "last_scan_at": datetime.now(timezone.utc).isoformat(),
-                    "first_scan_at": chan_state.get("first_scan_at", datetime.now(timezone.utc).isoformat()),
-                }
-                save_state(bs.state)
+                if bs.stop_scan:
+                    # прервано вручную: last_id НЕ продвигаем, запоминаем сделанное
+                    bs.state[channel] = {
+                        "last_id": last_id,
+                        "done_ids": sorted(done_ids),
+                        "last_scan_at": datetime.now(timezone.utc).isoformat(),
+                        "first_scan_at": chan_state.get("first_scan_at", datetime.now(timezone.utc).isoformat()),
+                    }
+                    save_state(bs.state)
+                else:
+                    # канал завершён полностью: last_id продвигаем, done_ids больше не нужны
+                    bs.state[channel] = {
+                        "last_id": max_id_seen,
+                        "last_scan_at": datetime.now(timezone.utc).isoformat(),
+                        "first_scan_at": chan_state.get("first_scan_at", datetime.now(timezone.utc).isoformat()),
+                    }
+                    save_state(bs.state)
                 channels_processed += 1
                 total_scanned += scanned
                 if not bs.stop_scan:
@@ -1007,7 +1112,12 @@ async def cmd_scan_execute(event, mode):
                     await asyncio.sleep(30)
             except Exception as e:
                 log.error(f"Scan error {channel}: {e}")
-        if bs.stop_scan:
+        if rate_limit_hit:
+            fin_text = (f"⏸ Лимит Gemini — сканирование приостановлено\n"
+                        f"Каналов: {channels_processed}/{len(chs)} | Новых лидов: {total_new} | "
+                        f"Gemini: {total_gemini}/1500\n"
+                        f"Прогресс сохранён. Нажмите «Сканировать» попозже — продолжу с того же места.")
+        elif bs.stop_scan:
             fin_text = f"⏹ Остановлено | Каналов: {channels_processed}/{len(chs)} | Новых лидов: {total_new} | Gemini: {total_gemini}"
         else:
             fin_text = f"✅ Скан завершён | Каналов: {channels_processed}/{len(chs)} | Новых лидов: {total_new} | Gemini: {total_gemini}/1500 | Всего в базе: {len(bs.leads)}"
