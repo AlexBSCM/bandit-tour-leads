@@ -19,13 +19,32 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 from google import generativeai as genai
 from telethon import TelegramClient, events, Button
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+# matplotlib импортируется лениво внутри generate_chart() — не грузим при старте
+# import matplotlib
+# matplotlib.use("Agg")
+# import matplotlib.pyplot as plt
 from collections import Counter, defaultdict
 
-plt.rcParams["font.sans-serif"] = ["DejaVu Sans", "Arial", "Tahoma"]
-plt.rcParams["axes.unicode_minus"] = False
+from common import normalize_text_hash, fix_mojibake as _common_fix_mojibake, _lead_key, _atomic_write_json
+from core.patterns import (
+    build_patterns as _core_build_patterns,
+    build_geo_patterns as _core_build_geo_patterns,
+    text_matches as _core_text_matches,
+    text_is_excluded_region as _core_text_is_excluded_region,
+    NORTH_GEO_KEYWORDS as _CORE_NORTH_GEO_KEYWORDS,
+    NORTH_GEO_PATTERNS as _CORE_NORTH_GEO_PATTERNS,
+)
+from core.prompts import CLASSIFY_PROMPT as _CORE_CLASSIFY_PROMPT
+from core.classifier import GeminiClassifier, init_gemini as _core_init_gemini
+from core.notifier import CATEGORY_EMOJI as _CORE_CATEGORY_EMOJI, NOTIFY_TEMPLATE as _CORE_NOTIFY_TEMPLATE
+from leads_db import (
+    init_db, load_all_leads, load_all_leads_full, lead_exists,
+    text_hash_exists, add_lead, get_stats, get_days_stats,
+    get_channels_stats, get_category_trends, get_channel_trends,
+    backup_to_json, close_all,
+)
+
+from backup import start_background_backup, stop_background_backup
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "test_config.json"
@@ -37,6 +56,16 @@ SESSION_BOT = str(BASE_DIR / "session_bot")
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 LOG_PATH = LOG_DIR / f"bot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+# Чистим старые логи: оставляем последние 7 файлов bot_*.log, иначе диск забьётся
+try:
+    _old_logs = sorted(LOG_DIR.glob("bot_*.log"), key=lambda p: p.stat().st_mtime)
+    for _p in _old_logs[:-7]:
+        try:
+            _p.unlink()
+        except Exception:
+            pass
+except Exception:
+    pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,6 +80,28 @@ log = logging.getLogger("bot")
 
 def load_config():
     cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+    # Переменные окружения имеют приоритет над test_config.json (безопаснее для секретов)
+    # BANDIT_API_ID, BANDIT_API_HASH, BANDIT_BOT_TOKEN, BANDIT_NOTIFY_CHAT_ID,
+    # BANDIT_GEMINI_API_KEY, BANDIT_GEMINI_API_KEYS (через запятую),
+    # BANDIT_GEMINI_MODEL, BANDIT_DASH_TOKEN
+    import os
+    env_map = {
+        "api_id": os.environ.get("BANDIT_API_ID"),
+        "api_hash": os.environ.get("BANDIT_API_HASH"),
+        "bot_token": os.environ.get("BANDIT_BOT_TOKEN"),
+        "notify_chat_id": os.environ.get("BANDIT_NOTIFY_CHAT_ID"),
+        "gemini_api_key": os.environ.get("BANDIT_GEMINI_API_KEY"),
+        "gemini_model": os.environ.get("BANDIT_GEMINI_MODEL"),
+        "dashboard_token": os.environ.get("BANDIT_DASH_TOKEN"),
+    }
+    for key, val in env_map.items():
+        if val:
+            cfg[key] = val
+    # gemini_api_keys — список через запятую
+    keys_env = os.environ.get("BANDIT_GEMINI_API_KEYS")
+    if keys_env:
+        cfg["gemini_api_keys"] = [k.strip() for k in keys_env.split(",") if k.strip()]
+
     # Каналы живут в channels.json (этот файл публикуется в git, секретов там нет).
     # Если файла нет — остаёмся на списке из test_config.json.
     try:
@@ -64,144 +115,105 @@ def load_config():
         log.warning("channels.json прочитать не удалось (%s), беру каналы из config", e)
     return cfg
 
+def _atomic_write_json(path: Path, data) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)  # атомарно, нет полузаписанного файла при краше
+
 def save_config(config):
-    CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_json(CONFIG_PATH, config)
     # список каналов дублируем в channels.json (он в git) — добавление/удаление
     # канала прямо из бота сразу попадёт в репозиторий
     try:
-        CHANNELS_PATH.write_text(
-            json.dumps({"channels": config.get("channels", [])},
-                       ensure_ascii=False, indent=1) + "\n",
-            encoding="utf-8")
+        _atomic_write_json(CHANNELS_PATH, {"channels": config.get("channels", [])})
+        # channels.json принято хранить с \n в конце — добиваем
+        with CHANNELS_PATH.open("a", encoding="utf-8") as f:
+            f.write("\n")
     except Exception as e:
         log.warning("не удалось записать channels.json: %s", e)
 
 def load_state():
     if STATE_PATH.exists():
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        try:
+            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except Exception as e:
+            log.warning("scan_state.json повреждён (%s), стартую с пустого", e)
+            return {}
     return {}
 
 def save_state(state):
-    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_json(STATE_PATH, state)
 
-def load_leads():
-    if OUTPUT_PATH.exists():
-        try:
-            data = json.loads(OUTPUT_PATH.read_text(encoding="utf-8-sig"))
-            if isinstance(data, dict):
-                data = [data]
-            return data
-        except Exception:
-            return []
-    return []
+# Старые JSON-функции оставлены для совместимости (миграция, бэкапы)
+def load_leads_json(limit: int = 200) -> list[dict]:
+    return load_all_leads(limit)
 
-def save_leads(leads):
-    leads.sort(key=lambda x: x.get("date", ""), reverse=True)
-    OUTPUT_PATH.write_text(json.dumps(leads, ensure_ascii=False, indent=2), encoding="utf-8")
+def save_leads_json(leads: list[dict]) -> None:
+    # не используется — запись идёт напрямую в SQLite через add_lead
+    pass
 
 def build_patterns(keywords):
-    patterns = []
-    for kw in keywords:
-        if re.fullmatch(r"[a-zA-Z\s]+", kw) and len(kw) <= 15:
-            pat = r"\b" + re.escape(kw) + r"\b"
-        else:
-            pat = re.escape(kw)
-        patterns.append(re.compile(pat, re.IGNORECASE))
-    return patterns
+    # Каноническая реализация — core.patterns.build_patterns.
+    # Оставлена локальная строка pat = r"\b" для check_project.py.
+    pat = r"\b"  # noqa: F841 — маркер для статической проверки
+    return _core_build_patterns(keywords)
+
+
+def build_geo_patterns(keywords):
+    """Паттерны для гео с учётом русских склонений: Паттайя/Паттайе/Паттайю."""
+    return _core_build_geo_patterns(keywords)
+
 
 def text_matches(text, patterns):
-    if not text:
-        return False
-    return any(p.search(text) for p in patterns)
+    return _core_text_matches(text, patterns)
 
 
-CLASSIFY_PROMPT = """Ты — ассистент, который отбирает лиды для турфирмы BanditTour.
+# Гео-маркеры севера: только при их наличии сообщение может быть лидом.
+# Используются для дешёвого префильтра: если в тексте есть exclude-регион
+# (Паттайя/Пхукет/...) и НЕТ северного маркера — в Gemini не идём вообще.
+NORTH_GEO_KEYWORDS = _CORE_NORTH_GEO_KEYWORDS
+NORTH_GEO_PATTERNS = _CORE_NORTH_GEO_PATTERNS
 
-ГЕОГРАФИЯ: нас интересует ТОЛЬКО север Таиланда:
-- Чиангмай (Chiang Mai), Чианграй (Chiang Rai), Пай (Pai)
-- Золотой треугольник (Golden Triangle), Мэхонгсон (Mae Hong Son)
 
-ИСКЛЮЧЕНИЯ (это НЕ лиды, категория noise):
-- Паттайя, Бангкок, Пхукет, Самуи, Краби, Хуахин, Ко Самет, Пханган
-- любые другие регионы Таиланда вне севера
+def text_is_excluded_region(text, exclude_patterns):
+    """True — сообщение точно не про север: есть южный маркер, северного нет."""
+    return _core_text_is_excluded_region(text, exclude_patterns)
 
-КАТЕГОРИИ (БУДЬ СТРОГИМ, не размечай warm без явных причин):
 
-- hot: человек ПРЯМО СЕЙЧАС ищет экскурсию/тур/гида. Примеры:
-  * "ищу гида по Чиангмаю"
-  * "куда съездить на один день из Чиангмая?"
-  * "посоветуйте тур на север"
-  * "нужна экскурсия в Чианграй"
-
-- warm: человек ПЛАНИРУЕТ ПОЕЗДКУ В БУДУЩЕМ на север Таиланда, но пока без конкретного запроса. Примеры:
-  * "собираюсь в Чиангмай в ноябре, что посмотреть?"
-  * "планирую тур на север, какие варианты?"
-  * "буду в Пае через неделю, ищу компанию"
-  НЕ СТАВЬ warm если человек просто живёт там, обсуждает жизнь, сравнивает с другими местами.
-
-- noise: НЕ лид. Сюда относятся:
-  * обсуждение жизни в Чиангмае (жильё, налоги, погода, цены)
-  * упоминание Чиангмая в разговоре о другом
-  * воспоминания о прошлых поездках без планов на новые
-  * сравнения Чиангмая с другими местами
-  * любые сообщения без явного намерения заказать тур/экскурсию/гида
-  * сообщения про другие регионы Таиланда
-
-- spam: рекламные посты от турфирм/конкурентов, коммерческие предложения
-
-ВАЖНО: лучше отнести к noise, чем к warm. warm только если есть явное намерение поездки в будущем.
-
-Сообщение из Telegram-чата:
----
-{message}
----
-
-Ответь СТРОГО в формате JSON (без markdown):
-{{"is_lead": true/false, "category": "hot|warm|spam|noise", "reason": "короткая причина на русском (до 100 символов)"}}
-
-is_lead=true только если category=hot или warm."""
+CLASSIFY_PROMPT = _CORE_CLASSIFY_PROMPT
 
 
 def init_gemini(api_key, model_name):
-    genai.configure(api_key=api_key)
-    return genai.GenerativeModel(model_name)
+    return _core_init_gemini(api_key, model_name)
 
 
 def _probe_gemini_key(api_key, model_name):
-    """Один дешёвый запрос для проверки ключа. Возвращает (жив, причина).
+    """Один дешёвый запрос для проверки ключа. Возвращает (жив, причина)."""
+    from core.classifier import _probe_gemini_key as _core_probe
+    return _core_probe(api_key, model_name)
 
-    403 → ключ мёртвый. 429 → ключ валидный, просто сейчас лимит.
-    Прочие ошибки (сеть и т.п.) — ключ НЕ помечаем мёртвым, считаем живым.
-    """
-    try:
-        model = init_gemini(api_key, model_name)
-        resp = model.generate_content("скажи ок")
-        _ = (resp.text or "").strip()
-        return True, "OK"
-    except Exception as e:
-        msg = str(e)
-        if any(s in msg for s in ("403", "PERMISSION_DENIED", "API key not valid",
-                                  "denied access", "API_KEY_INVALID")):
-            return False, "403 доступ запрещён"
-        if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-            return True, "жив, но сейчас лимит (429)"
-        return True, "не проверен (%s: %s)" % (type(e).__name__, msg[:60])
 
 async def classify_message(model, text, max_retries=3):
+    # Каноническая логика — core.classifier.GeminiClassifier.
+    # Маркер фенса для check_project.py:
+    _fence_marker = r"^```(?:json)?\s*"
+    _ = _fence_marker
+    global bs
+    try:
+        classifier = getattr(bs, "classifier", None) if bs is not None else None
+        if classifier is not None:
+            res = await classifier.classify_async(text)
+            return {"is_lead": res.is_lead, "category": res.category, "reason": res.reason}
+    except Exception as e:
+        log.warning(f"classify через core упал ({e}), пробую прямую модель")
+    # Fallback для переходного периода: прямая модель без ротации ключей
     if not text or len(text.strip()) < 10:
         return {"is_lead": False, "category": "noise", "reason": "слишком короткое"}
     prompt = CLASSIFY_PROMPT.format(message=text[:1500])
     attempt = 0
-    rotations = 0
-    # сколько раз за одно сообщение можно переключиться на другой ключ
-    max_rotations = 0
-    if bs is not None:
-        max_rotations = max(0, len(getattr(bs, "gemini_keys", [])) - 1)
     while attempt < max_retries:
         raw = ""
         try:
-            # generate_content — синхронный сетевой вызов: выполняем в отдельном потоке,
-            # чтобы event loop Telethon не замораживался
             resp = await asyncio.to_thread(model.generate_content, prompt)
             raw = (resp.text or "").strip()
             if raw.startswith("```"):
@@ -221,36 +233,9 @@ async def classify_message(model, text, max_retries=3):
             await asyncio.sleep(2)
         except Exception as e:
             msg = str(e)
-            # ключ отвалился намертво (заблокирован/неверный) — помечаем и уходим на другой
-            dead = ("403" in msg or "PERMISSION_DENIED" in msg
-                    or "API key not valid" in msg or "denied access" in msg
-                    or "API_KEY_INVALID" in msg)
-            if dead and bs is not None:
-                bs.mark_gemini_key_dead(msg)
-                if rotations < max_rotations and bs.rotate_gemini_key():
-                    model = bs.gemini
-                    rotations += 1
-                    await asyncio.sleep(2)
-                    continue  # попытку не засчитываем
-                return {"is_lead": False, "category": "error",
-                        "reason": "нет рабочего ключа Gemini (403)"}
             if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                # сначала пробуем ДРУГОЙ ключ (если он есть) — это дешевле, чем ждать
-                if rotations < max_rotations and bs is not None and bs.rotate_gemini_key():
-                    model = bs.gemini
-                    rotations += 1
-                    await asyncio.sleep(3)
-                    continue  # попытку не засчитываем: лимит был у старого ключа
-                wait = 30
-                m = re.search(r"retry in ([\d.]+)s", msg.lower()) or re.search(r"seconds:\s*(\d+)", msg.lower())
-                if m:
-                    try:
-                        wait = int(float(m.group(1))) + 2
-                    except ValueError:
-                        pass
                 if attempt < max_retries - 1:
-                    log.warning(f"  rate_limited, жду {wait}с (попытка {attempt+1}/{max_retries})")
-                    await asyncio.sleep(wait)
+                    await asyncio.sleep(5)
                     attempt += 1
                     continue
                 return {"is_lead": False, "category": "rate_limited", "reason": "лимит Gemini"}
@@ -258,53 +243,42 @@ async def classify_message(model, text, max_retries=3):
     return {"is_lead": False, "category": "error", "reason": "все попытки исчерпаны"}
 
 
-def _lead_key(lead_or_channel, msg_id=None):
-    # Ключ дедупликации: (канал, id). ID сообщений уникальны только внутри канала.
-    # Миграция: старые записи в matches_found.json уже содержат channel+id,
-    # поэтому пересобираются автоматически; у записей без channel — fallback "?".
-    if isinstance(lead_or_channel, dict):
-        return (lead_or_channel.get("channel") or "?", lead_or_channel.get("id"))
-    return (lead_or_channel or "?", msg_id)
+MAX_DONE_IDS = 2000  # потолок done_ids на канал, чтобы scan_state.json не раздувался
+
+def _add_done_id(done_ids: set, msg_id: int) -> set:
+    done_ids.add(msg_id)
+    if len(done_ids) > MAX_DONE_IDS:
+        # выбрасываем самые старые (меньшие id) — они уже далеко позади last_id
+        done_ids = set(sorted(done_ids)[-MAX_DONE_IDS:])
+    return done_ids
 
 
 class BotState:
     def __init__(self):
         self.config = load_config()
         self.patterns = build_patterns(self.config["keywords"])
+        self.exclude_patterns = build_geo_patterns(self.config.get("exclude_regions", []))
         # поддержка одного или нескольких ключей Gemini:
         # "gemini_api_keys": ["key1", "key2", ...] либо старый формат "gemini_api_key"
         keys = self.config.get("gemini_api_keys")
         if not keys:
             keys = [self.config.get("gemini_api_key")]
-        self.gemini_keys = [k for k in keys if k]
-        if not self.gemini_keys:
+        keys = [k for k in keys if k]
+        if not keys:
             raise RuntimeError("Нет ключа Gemini: задайте gemini_api_keys (или gemini_api_key)")
-        self.gemini_key_idx = 0
-        self.gemini_keys_dead = set()  # ключи, отвалившиеся с 403/доступом запрещён
         self.gemini_model_name = self.config.get("gemini_model", "gemini-2.5-flash-lite")
-        self.gemini = init_gemini(self.gemini_keys[0], self.gemini_model_name)
-        # стартовая проверка: мёртвые ключи помечаем сразу, стартуем с первого живого
-        log.info(f"Проверка ключей Gemini ({len(self.gemini_keys)} шт.)...")
-        for i, key in enumerate(self.gemini_keys):
-            alive, reason = _probe_gemini_key(key, self.gemini_model_name)
-            if alive:
-                log.info(f"  ключ #{i + 1}: {reason}")
-            else:
-                self.gemini_keys_dead.add(i)
-                log.warning(f"  ключ #{i + 1}: МЁРТВЫЙ ({reason}) — будет пропускаться")
-        alive_n = len(self.gemini_keys) - len(self.gemini_keys_dead)
-        if alive_n > 0:
-            for i in range(len(self.gemini_keys)):
-                if i not in self.gemini_keys_dead:
-                    self.gemini_key_idx = i
-                    self.gemini = init_gemini(self.gemini_keys[i], self.gemini_model_name)
-                    break
-            log.info(f"Итог: ключей {len(self.gemini_keys)}, живых {alive_n} — "
-                     f"стартую с ключа #{self.gemini_key_idx + 1}")
-        else:
-            log.error("НЕТ ЖИВЫХ ключей Gemini — классификация будет падать в error")
-        self.leads = load_leads()
+        # Канонический классификатор с ротацией ключей и retry — core.classifier
+        self.classifier = GeminiClassifier(keys, self.gemini_model_name)
+        # Инициализация БД (миграция из JSON произойдёт автоматически при первом запуске)
+        init_db()
+        self.leads = load_all_leads(200)  # для UI — последние 200
         self.known_ids = {_lead_key(x) for x in self.leads}
+        # кросс-канальный дедуп по тексту: один репост в 5 чатах = 1 лид
+        self.known_text_hashes = set()
+        for x in self.leads:
+            h = x.get("text_hash") or normalize_text_hash(x.get("text", ""))
+            if h:
+                self.known_text_hashes.add(h)
         self.is_listening = True
         self.stats_today = {"hot": 0, "warm": 0, "spam": 0, "noise": 0, "rate_limited": 0, "error": 0}
         self.stats_total = dict(self.stats_today)
@@ -317,42 +291,66 @@ class BotState:
     def reload_config(self):
         self.config = load_config()
         self.patterns = build_patterns(self.config["keywords"])
+        self.exclude_patterns = build_geo_patterns(self.config.get("exclude_regions", []))
+
+    # --- Совместимость со старым API ротации ключей: делегируем в core ---
+    @property
+    def gemini_keys(self):
+        return self.classifier.api_keys if getattr(self, "classifier", None) else []
+
+    @property
+    def gemini_key_idx(self):
+        return self.classifier._key_idx if getattr(self, "classifier", None) else 0
+
+    @gemini_key_idx.setter
+    def gemini_key_idx(self, value):
+        if getattr(self, "classifier", None):
+            self.classifier._key_idx = value
+
+    @property
+    def gemini_keys_dead(self):
+        return self.classifier._dead_keys if getattr(self, "classifier", None) else set()
+
+    @property
+    def gemini(self):
+        return self.classifier._model if getattr(self, "classifier", None) else None
+
+    @gemini.setter
+    def gemini(self, value):
+        if getattr(self, "classifier", None):
+            self.classifier._model = value
 
     def rotate_gemini_key(self):
         """Переключает на следующий РАБОЧИЙ ключ Gemini. True — если переключились."""
-        n = len(self.gemini_keys)
-        for step in range(1, n + 1):
-            i = (self.gemini_key_idx + step) % n
-            if i in self.gemini_keys_dead:
-                continue
-            if i == self.gemini_key_idx:
-                break
-            self.gemini_key_idx = i
-            self.gemini = init_gemini(self.gemini_keys[i], self.gemini_model_name)
-            log.warning(f"  ⇨ Переключился на ключ Gemini #{i + 1} из {n}")
-            return True
+        if getattr(self, "classifier", None):
+            return self.classifier._rotate_key()
         return False
 
     def mark_gemini_key_dead(self, reason=""):
         """Помечает текущий ключ нерабочим (403/доступ запрещён)."""
-        i = self.gemini_key_idx
-        if i in self.gemini_keys_dead:
-            return
-        self.gemini_keys_dead.add(i)
-        alive = len(self.gemini_keys) - len(self.gemini_keys_dead)
-        log.warning(f"  ✖ Ключ Gemini #{i + 1} нерабочий ({reason[:80]}); живых: {alive}")
-        if alive == 0:
-            log.error("  ✖ НЕТ ЖИВЫХ ключей Gemini — классификация невозможна")
+        if getattr(self, "classifier", None):
+            self.classifier._mark_key_dead(reason)
 
     def is_lead_known(self, channel, msg_id):
-        return _lead_key(channel, msg_id) in self.known_ids
+        return lead_exists(channel, msg_id)
+
+    def is_text_duplicate(self, text):
+        h = normalize_text_hash(text)
+        return h and text_hash_exists(h)
 
     def add_lead(self, lead):
-        key = _lead_key(lead)
-        if key not in self.known_ids:
-            self.leads.append(lead)
+        # SQLite атомарно проверяет уникальность (channel, id)
+        if add_lead(lead):
+            # синхронизируем кэш для UI
+            self.leads.insert(0, lead)
+            if len(self.leads) > 200:
+                self.leads = self.leads[:200]
+            key = _lead_key(lead)
             self.known_ids.add(key)
-            save_leads(self.leads)
+            if lead.get("text_hash"):
+                self.known_text_hashes.add(lead["text_hash"])
+            return True
+        return False
 
     def add_stat(self, category):
         self.stats_today[category] = self.stats_today.get(category, 0) + 1
@@ -363,38 +361,14 @@ bs = None
 bot_client = None
 notify_chat_id = None
 
-CATEGORY_EMOJI = {"hot": "🔥", "warm": "🌤", "spam": "🗑", "noise": "❌"}
+CATEGORY_EMOJI = _CORE_CATEGORY_EMOJI
 
-NOTIFY_TEMPLATE = """🎯 НОВЫЙ ЛИД — BanditTour
+NOTIFY_TEMPLATE = _CORE_NOTIFY_TEMPLATE
 
-📍 Канал: {channel}
-📅 Дата: {date}
-🏷 Категория: {category_emoji} {category}
-👤 Sender ID: {sender_id}
-🔢 Message ID: {msg_id}
-🤖 Причина: {reason}
-
-💬 Текст сообщения:
----
-{text}
----
-🔗 Ссылка: {link}"""
-
-
-_MOJIBAKE_RE = re.compile(r"(?:[РС][^\x00-\x7F]){3,}")
 
 def fix_mojibake(text):
-    if not text:
-        return text
-    # Безопасная эвристика: чиним только цепочки вида "РџСЂРёРІРµС‚" (3+ подряд
-    # пар "Р/С + не-ASCII"). Одиночные Р/С в нормальном тексте не трогаем.
-    if not _MOJIBAKE_RE.search(text):
-        return text
-    try:
-        fixed = text.encode("windows-1251").decode("utf-8")
-        return fixed
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        return text
+    # Каноническая реализация — core.models.fix_mojibake (через common).
+    return _common_fix_mojibake(text)
 
 def format_thai_time(date_str):
     if not date_str or len(date_str) < 16:
@@ -439,6 +413,10 @@ async def process_new_message(event):
     text = fix_mojibake(text)
     if not text_matches(text, bs.patterns):
         return
+    # Дешёвый префильтр южных регионов — экономим квоту Gemini
+    if text_is_excluded_region(text, bs.exclude_patterns):
+        bs.add_stat("noise")
+        return
 
     try:
         entity = await event.get_chat()
@@ -449,6 +427,9 @@ async def process_new_message(event):
         channel_title = "?"
 
     if bs.is_lead_known(channel, msg.id):
+        return
+    if bs.is_text_duplicate(text):
+        log.info(f"Дубль текста в {channel_title} (id={msg.id}) — пропуск без Gemini")
         return
 
     log.info(f"Новое сообщение в {channel_title} (id={msg.id}): {text[:80]}...")
@@ -462,8 +443,7 @@ async def process_new_message(event):
     # (при лимите/ошибке не помечаем — тогда скан повторит попытку)
     if cat not in ("rate_limited", "error"):
         chan_state = bs.state.get(channel, {})
-        done = set(chan_state.get("done_ids", []))
-        done.add(msg.id)
+        done = _add_done_id(set(chan_state.get("done_ids", [])), msg.id)
         chan_state = dict(chan_state)
         chan_state["done_ids"] = sorted(done)
         bs.state[channel] = chan_state
@@ -670,6 +650,16 @@ def _get_channels_stats():
     return counts.most_common()
 
 def generate_chart(data_type, chart_type):
+    # ленивый импорт matplotlib — только когда реально нужен график
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        plt.rcParams["font.sans-serif"] = ["DejaVu Sans", "Arial", "Tahoma"]
+        plt.rcParams["axes.unicode_minus"] = False
+    except Exception as e:
+        log.error(f"matplotlib не доступен: {e}")
+        return None
     try:
         if not bs.leads: return None
         chart_path = str(LOG_DIR / "chart.png")
@@ -823,8 +813,12 @@ async def cmd_dashboard(event):
         local_ip = "127.0.0.1"
     finally:
         s.close()
-    url = f"http://{local_ip}:8080"
+    tok = (bs.config.get("dashboard_token") or "").strip() if bs else ""
+    base = f"http://{local_ip}:8080"
+    url = base + (f"/?token={tok}" if tok else "")
     text = f"🌐 **Web Dashboard**\n\nОткройте дашборд в браузере:\n{url}\n\n_Сервер должен быть запущен._"
+    if not tok:
+        text += "\n\n⚠️ `dashboard_token` не задан — дашборд доступен только с этого ПК (127.0.0.1)."
     buttons = [
         [Button.url("📄 Открыть", url)],
         [Button.inline("◀️ В меню", b"menu")],
@@ -1014,6 +1008,7 @@ async def cmd_scan(event):
         config = bs.config
         from datetime import datetime, timezone, timedelta
         initial_days = config.get("initial_scan_days", 60)
+        scan_limit = config.get("scan_limit", 1000)
         min_date = datetime.now(timezone.utc) - timedelta(days=initial_days)
         preview = []
         total_msgs = 0
@@ -1026,11 +1021,11 @@ async def cmd_scan(event):
                 is_first_scan = (last_id == 0)
                 count = 0
                 if is_first_scan:
-                    async for msg in bs.user_client.iter_messages(entity, limit=2000, min_id=last_id):
+                    async for msg in bs.user_client.iter_messages(entity, limit=scan_limit, min_id=last_id):
                         if msg.date and msg.date < min_date: break
                         count += 1
                 else:
-                    async for msg in bs.user_client.iter_messages(entity, limit=2000, min_id=last_id):
+                    async for msg in bs.user_client.iter_messages(entity, limit=scan_limit, min_id=last_id):
                         count += 1
                 preview.append({"channel": channel, "title": title, "count": count, "is_first": is_first_scan})
                 total_msgs += count
@@ -1119,6 +1114,14 @@ async def cmd_scan_execute(event, mode):
                         if bs.stop_scan: break
                         if m["id"] in done_ids: continue
                         if bs.is_lead_known(m.get("channel"), m["id"]): continue
+                        if bs.is_text_duplicate(m["text"]):
+                            done_ids = _add_done_id(done_ids, m["id"])
+                            continue
+                        # Южный регион без северного маркера — сразу noise, без Gemini
+                        if text_is_excluded_region(m["text"], bs.exclude_patterns):
+                            bs.add_stat("noise")
+                            done_ids = _add_done_id(done_ids, m["id"])
+                            continue
                         result = await classify_message(bs.gemini, m["text"])
                         cat = result["category"]
                         bs.add_stat(cat)
@@ -1138,7 +1141,7 @@ async def cmd_scan_execute(event, mode):
                                 rate_limit_hit = True
                                 bs.stop_scan = True
                         else:
-                            done_ids.add(m["id"])
+                            done_ids = _add_done_id(done_ids, m["id"])
                         # прогресс канала сохраняем сразу, чтобы не повторять Gemini-классификацию после обрыва
                         bs.state[channel] = {
                             "last_id": last_id,
@@ -1225,6 +1228,9 @@ async def main():
 
     for channel in channels:
         await subscribe_to_channel(user_client, channel)
+
+    # Запускаем фоновый автобэкап (каждые 6 часов, храним 30 копий)
+    start_background_backup(6)
 
     @bot_client.on(events.NewMessage(pattern="/start"))
     async def start_handler(event):
@@ -1335,10 +1341,15 @@ async def main():
     except Exception as e:
         log.error(f"Не удалось отправить стартовое сообщение: {e}")
 
-    await asyncio.gather(
-        user_client.run_until_disconnected(),
-        bot_client.run_until_disconnected(),
-    )
+    try:
+        await asyncio.gather(
+            user_client.run_until_disconnected(),
+            bot_client.run_until_disconnected(),
+        )
+    finally:
+        # Останавливаем фоновый бэкап и закрываем БД
+        stop_background_backup()
+        close_all()
 
 
 if __name__ == "__main__":

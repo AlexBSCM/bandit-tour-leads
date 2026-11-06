@@ -85,3 +85,8 @@ update_prompt*.py
 
 # === Статусы лидов в дашборде (рабочие данные) ===
 lead_ui_state.json
+
+# === Базы данных и бэкапы (не коммитить) ===
+leads.db
+leads.db-*
+backups/

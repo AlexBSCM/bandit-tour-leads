@@ -2,12 +2,10 @@
 
 Запуск:  python dashboard_server.py [port]
 По умолчанию порт 8080 (его же показывает кнопка «Дашборд» в боте).
-Данные читаются вживую из matches_found.json / scan_state.json,
-ничего генерировать заранее не нужно.
+Данные читаются из SQLite (leads.db), ничего генерировать заранее не нужно.
 
 Статусы лидов (новый / прочитан / архив) хранятся отдельно в
-lead_ui_state.json — бот этот файл не трогает, поэтому его отметки
-не затираются при сохранении matches_found.json.
+lead_ui_state.json — бот этот файл не трогает.
 
 Эндпоинты:
   /                  — HTML-страница: статистика + фильтры + таблица лидов
@@ -17,14 +15,21 @@ lead_ui_state.json — бот этот файл не трогает, поэто�
 """
 import html
 import json
+import os
 import sys
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
+
+# Добавляем путь к bot.py для импорта leads_db
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from leads_db import (
+    init_db, load_all_leads, load_all_leads_full, get_stats,
+    get_days_stats, get_channels_stats, get_category_trends, get_channel_trends,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
-LEADS_PATH = BASE_DIR / "matches_found.json"
 STATE_PATH = BASE_DIR / "scan_state.json"
 CONFIG_PATH = BASE_DIR / "test_config.json"
 LEAD_UI_PATH = BASE_DIR / "lead_ui_state.json"
@@ -32,6 +37,14 @@ LEAD_UI_PATH = BASE_DIR / "lead_ui_state.json"
 EMOJI = {"hot": "🔥", "warm": "🌤", "spam": "🗑", "noise": "❌"}
 STATUSES = ("new", "read", "archived")
 STATUS_TITLE = {"new": "Новые", "read": "Прочитанные", "archived": "Архив"}
+
+# Инициализируем БД при импорте
+init_db()
+
+
+def lead_key(lead):
+    """Ключ статуса для лида: (канал, id) — совпадает с дедупликацией бота."""
+    return "%s|%s" % (lead.get("channel") or "?", lead.get("id"))
 
 
 def load_json(path, default):
@@ -41,11 +54,6 @@ def load_json(path, default):
     except Exception:
         pass
     return default
-
-
-def lead_key(lead):
-    """Ключ статуса для лида: (канал, id) — совпадает с дедупликацией бота."""
-    return "%s|%s" % (lead.get("channel") or "?", lead.get("id"))
 
 
 def load_lead_state():
@@ -59,14 +67,37 @@ def save_lead_state(state):
     tmp.replace(LEAD_UI_PATH)  # атомарная замена, чтобы не было обрыва записи
 
 
-def get_stats(leads):
-    cats = Counter((l.get("category") or "?") for l in leads)
-    chans = Counter((l.get("channel_title") or l.get("channel") or "?") for l in leads)
-    return {
-        "total": len(leads),
-        "by_category": dict(cats),
-        "by_channel": dict(chans.most_common(20)),
-    }
+def get_dashboard_token():
+    tok = os.environ.get("BANDIT_DASH_TOKEN", "").strip()
+    if tok:
+        return tok
+    try:
+        if CONFIG_PATH.exists():
+            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+            t = str(cfg.get("dashboard_token") or "").strip()
+            return t
+    except Exception:
+        pass
+    return ""
+
+
+DASH_TOKEN = get_dashboard_token()
+
+
+def is_authorized(handler: BaseHTTPRequestHandler) -> bool:
+    if not DASH_TOKEN:
+        return True  # без токена слушаем только localhost (см. main), там auth не нужен
+    parsed = urlparse(handler.path)
+    qs = parse_qs(parsed.query)
+    if qs.get("token", [""])[0] == DASH_TOKEN:
+        return True
+    hdr = handler.headers.get("X-Dashboard-Token") or ""
+    if hdr == DASH_TOKEN:
+        return True
+    auth = handler.headers.get("Authorization") or ""
+    if auth == "Bearer " + DASH_TOKEN:
+        return True
+    return False
 
 
 PAGE_TEMPLATE = r"""<!DOCTYPE html>
@@ -156,6 +187,12 @@ $rows
 <script>
 let state = $state_json;
 let filter = localStorage.getItem('bt-filter') || 'new';
+let URL_TOKEN = '';
+try { URL_TOKEN = new URLSearchParams(location.search).get('token') || ''; } catch (e) {}
+function apiUrl(p) {
+  if (!URL_TOKEN) return p;
+  return p + (p.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(URL_TOKEN);
+}
 
 function rowStatus(tr) { return tr.getAttribute('data-status'); }
 
@@ -192,7 +229,7 @@ async function setStatus(btn, st) {
   if (st === 'new') { delete state[key]; } else { state[key] = st; }
   recount(); applyFilter();
   try {
-    await fetch('/api/lead-state', {
+    await fetch(apiUrl('/api/lead-state'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ key: key, status: st })
@@ -214,10 +251,11 @@ recount(); applyFilter();
 </html>"""
 
 
-def render_page(leads):
+def render_page():
     from datetime import datetime
     updated = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-    stats = get_stats(leads)
+    leads = load_all_leads(200)  # последние 200
+    stats = get_stats()  # из SQLite
     ui_state = load_lead_state()
 
     counts = {"new": 0, "read": 0, "archived": 0}
@@ -236,7 +274,7 @@ def render_page(leads):
                 '(python bot.py) и дождитесь первых находок.</td></tr>')
     else:
         out = []
-        for l in leads[:200]:  # последние 200, файл уже отсортирован по дате
+        for l in leads:
             cat = l.get("category", "?")
             date = (l.get("date") or "?")[:16].replace("T", " ")
             chan = html.escape(str(l.get("channel_title") or l.get("channel") or "?"))
@@ -274,13 +312,13 @@ def render_page(leads):
     page = PAGE_TEMPLATE
     for token, value in (
         ("$updated", updated),
-        ("$total", str(len(leads))),
+        ("$total", str(stats["total"])),
         ("$cards", "".join(cards)),
         ("$rows", rows),
         ("$n_new", str(counts["new"])),
         ("$n_read", str(counts["read"])),
         ("$n_arch", str(counts["archived"])),
-        ("$n_all", str(len(leads))),
+        ("$n_all", str(stats["total"])),
         ("$state_json", state_js),
     ):
         page = page.replace(token, value, 1)
@@ -315,26 +353,30 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if not is_authorized(self):
+            self._send(json.dumps({"ok": False, "error": "forbidden"}), "application/json", code=403)
+            return
         path = urlparse(self.path).path
-        leads = load_json(LEADS_PATH, [])
-        if not isinstance(leads, list):
-            leads = [leads] if leads else []
         if path == "/api/leads":
+            leads = load_all_leads_full()
             self._send(json.dumps(leads, ensure_ascii=False), "application/json")
         elif path == "/api/lead-state":
             self._send(json.dumps(load_lead_state(), ensure_ascii=False), "application/json")
         elif path == "/api/stats":
             state = load_json(STATE_PATH, {})
-            stats = get_stats(leads)
+            stats = get_stats()
             stats["channels_tracked"] = list(state.keys())
             self._send(json.dumps(stats, ensure_ascii=False), "application/json")
         elif path in ("/", "/index.html"):
-            self._send(render_page(leads), "text/html")
+            self._send(render_page(), "text/html")
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_POST(self):
+        if not is_authorized(self):
+            self._send(json.dumps({"ok": False, "error": "forbidden"}), "application/json", code=403)
+            return
         path = urlparse(self.path).path
         if path != "/api/lead-state":
             self.send_response(404)
@@ -369,8 +411,16 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    print(f"Dashboard: http://127.0.0.1:{port}  (Ctrl+C — остановить)")
+    # Без токена — только localhost, чтобы лиды не светились всей LAN.
+    # С токеном (dashboard_token в test_config.json или BANDIT_DASH_TOKEN) — можно 0.0.0.0.
+    host = "127.0.0.1" if not DASH_TOKEN else "0.0.0.0"
+    if "--public" in sys.argv:
+        host = "0.0.0.0"
+    if host == "0.0.0.0" and not DASH_TOKEN:
+        print("WARNING: без dashboard_token дашборд открыт всей сети. "
+              "Задайте dashboard_token или уберите --public.")
+    server = HTTPServer((host, port), Handler)
+    print(f"Dashboard: http://{host}:{port}  (Ctrl+C — остановить)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
