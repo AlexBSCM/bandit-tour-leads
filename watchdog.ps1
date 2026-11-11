@@ -1,4 +1,4 @@
-# BanditTour Bot Watchdog
+﻿# BanditTour Bot Watchdog
 # Проверяет, что запущен именно bot.py, и перезапускает его при необходимости.
 # Запуск вручную:  powershell -ExecutionPolicy Bypass -File watchdog.ps1
 # Для автозапуска: Планировщик заданий Windows каждые 5 минут.
@@ -32,7 +32,9 @@ function Send-TelegramAlert {
         $config = Get-Content $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
         $url = "https://api.telegram.org/bot$($config.bot_token)/sendMessage"
         $body = @{ chat_id = $config.notify_chat_id; text = $Message } | ConvertTo-Json
-        Invoke-RestMethod -Uri $url -Method Post -Body $body -ContentType "application/json; charset=utf-8" | Out-Null
+        # PS 5.1 кодирует строку Body в ANSI, поэтому отправляем явно UTF-8 байты
+        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+        Invoke-RestMethod -Uri $url -Method Post -Body $bodyBytes -ContentType "application/json; charset=utf-8" | Out-Null
     } catch {
         Write-Log "Не удалось отправить Telegram-уведомление: $_"
     }
