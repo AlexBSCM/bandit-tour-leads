@@ -87,10 +87,34 @@ API: /api/leads, /api/stats.
 ### Запуск на Windows
 
 - `run_bot.bat` — скрытый запуск бота (двойной клик)
+- `run_bot_hidden.vbs` — скрытый лаунчер для `run_bot.bat` (без окна консоли, для автозапуска)
 - `run_dashboard_hidden.vbs` — скрытый запуск дашборда
 - `watchdog.ps1` — проверка, что запущен именно bot.py, и автоперезапуск.
-  Для периодического запуска используйте Планировщик заданий Windows (каждые 5 минут):
-  `powershell -ExecutionPolicy Bypass -File watchdog.ps1`
+
+### Автозапуск при старте ноутбука
+
+Настроен через Планировщик заданий Windows (задачи в состоянии Ready):
+
+| Задача | Триггер | Действие |
+|--------|---------|----------|
+| `BanditTour Bot Autostart` | При входе в систему, задержка 1 мин | `wscript.exe run_bot_hidden.vbs` |
+| `BanditTour Watchdog` | Каждые 5 минут | `wscript.exe run_watchdog_hidden.vbs` |
+
+Задачи запускаются от текущего пользователя, работают и от батареи, логи: `logs\startup.log` и `logs\watchdog.log`.
+Если задачи были удалены, их можно создать заново командами (PowerShell):
+
+```powershell
+$action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument '"D:\Opencode\BanditTour Lead Scanner\run_bot_hidden.vbs"'
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$trigger.Delay = 'PT1M'
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+Register-ScheduledTask -TaskName 'BanditTour Bot Autostart' -Action $action -Trigger $trigger -Settings $settings -Force
+
+$action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument '"D:\Opencode\BanditTour Lead Scanner\run_watchdog_hidden.vbs"'
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::FromMinutes(5)) -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName 'BanditTour Watchdog' -Action $action -Trigger $trigger -Settings $settings -Force
+```
 
 ### Команды бота
 
@@ -111,6 +135,8 @@ API: /api/leads, /api/stats.
 | dashboard_server.py | Веб-дашборд (stdlib, порт 8080) | Да |
 | check_project.py | Проверка без Telegram-ключей | Да |
 | run_bot.bat | Скрытый запуск бота (Windows) | Да |
+| run_bot_hidden.vbs | Скрытый лаунчер run_bot.bat (автозапуск) | Да |
+| run_watchdog_hidden.vbs | Скрытый запуск watchdog.ps1 (Планировщик) | Да |
 | run_dashboard_hidden.vbs | Скрытый запуск дашборда (Windows) | Да |
 | watchdog.ps1 | Автоперезапуск bot.py (Windows) | Да |
 | requirements.txt | Python-зависимости | Да |

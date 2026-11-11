@@ -6,6 +6,7 @@
 $ProjectDir = $PSScriptRoot
 $BotScript = Join-Path $ProjectDir "bot.py"
 $BatPath = Join-Path $ProjectDir "run_bot.bat"
+$HiddenLauncher = Join-Path $ProjectDir "run_bot_hidden.vbs"
 $LogFile = Join-Path $ProjectDir "logs\watchdog.log"
 $MaxLogSize = 1MB
 
@@ -61,18 +62,24 @@ Write-Log "WARNING: bot.py not running, restarting..."
 # Чистим journal-файлы SQLite (ошибка database is locked)
 Get-ChildItem $ProjectDir -Filter "*.session-journal" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
-if (Test-Path $BatPath) {
+# Запускаем скрытно через VBS-лаунчер (без окна консоли), если он есть.
+if (Test-Path $HiddenLauncher) {
+    Start-Process -FilePath "wscript.exe" -ArgumentList ('"' + $HiddenLauncher + '"') -WorkingDirectory $ProjectDir
+    Write-Log "OK: restart initiated via run_bot_hidden.vbs"
+} elseif (Test-Path $BatPath) {
     Start-Process -FilePath $BatPath -WorkingDirectory $ProjectDir
     Write-Log "OK: restart initiated via run_bot.bat"
-    Start-Sleep -Seconds 20
-    $botProcess = Get-BotProcess
-    if ($botProcess) {
-        Write-Log "OK: bot successfully restarted (PID $($botProcess.ProcessId))"
-        Send-TelegramAlert -Message "BanditTour Bot был остановлен и автоматически перезапущен (watchdog). Время: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-    } else {
-        Write-Log "ERROR: bot failed to start after restart attempt"
-        Send-TelegramAlert -Message "BanditTour Bot НЕ удалось перезапустить! Время: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'). Проверьте вручную."
-    }
 } else {
-    Write-Log "ERROR: run_bot.bat not found at $BatPath"
+    Write-Log "ERROR: ни run_bot_hidden.vbs, ни run_bot.bat не найдены в $ProjectDir"
+    exit 1
+}
+Write-Log "OK: restart initiated"
+Start-Sleep -Seconds 20
+$botProcess = Get-BotProcess
+if ($botProcess) {
+    Write-Log "OK: bot successfully restarted (PID $($botProcess.ProcessId))"
+    Send-TelegramAlert -Message "BanditTour Bot был остановлен и автоматически перезапущен (watchdog). Время: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+} else {
+    Write-Log "ERROR: bot failed to start after restart attempt"
+    Send-TelegramAlert -Message "BanditTour Bot НЕ удалось перезапустить! Время: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'). Проверьте вручную."
 }

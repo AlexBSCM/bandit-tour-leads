@@ -68,7 +68,6 @@ session_user.session
 session_bot.session
 session_user.session-journal
 session_bot.session-journal
-run_bot_hidden.vbs
 bot_*.log
 bot_hidden.log
 chart.png
